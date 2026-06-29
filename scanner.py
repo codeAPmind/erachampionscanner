@@ -78,8 +78,8 @@ def main():
 
     # API Key
     api_key = args.fmp_key or FMP_API_KEY
-    if api_key == "YOUR_FMP_API_KEY_HERE":
-        print("⚠️  请在 config.py 中配置 FMP_API_KEY，或使用 --fmp-key 参数传入")
+    if not api_key or api_key == "YOUR_FMP_API_KEY_HERE":
+        print("⚠️  请在 .env 中配置 FMP_API_KEY，或使用 --fmp-key 参数传入")
         print("   获取 API Key: https://financialmodelingprep.com/developer/docs/")
         sys.exit(1)
 

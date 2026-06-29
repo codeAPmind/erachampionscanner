@@ -8,10 +8,7 @@ import sys
 import requests
 
 # 从环境变量读取，也可在 config.py 里写死
-FEISHU_WEBHOOK = os.environ.get(
-    "FEISHU_BOT_WEBHOOK",
-    "https://open.feishu.cn/open-apis/bot/v2/hook/d06d0fd7-27a9-4324-a1f1-84f6493c4b86",
-)
+FEISHU_WEBHOOK = os.environ.get("FEISHU_BOT_WEBHOOK", "")
 
 MAX_MSG_CHARS = 12000  # 飞书单条文本上限约 30KB，保守截断
 

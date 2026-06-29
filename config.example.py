@@ -1,7 +1,7 @@
 """
 Era Champion Scanner — 配置文件模板
-复制此文件为 config.py 并填入真实 Key：
-    cp config.example.py config.py
+推荐：复制 .env.example 为 .env 并填入真实 Key，然后：
+    cp config.example.py config.py   # 或直接使用仓库内已生成的 config.py（从 .env 读密钥）
 """
 
 # ============================================================

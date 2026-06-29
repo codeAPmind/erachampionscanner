@@ -13,8 +13,18 @@ set -euo pipefail
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$PROJECT_DIR"
 
+if [ -f ".env" ]; then
+  set -a
+  # shellcheck disable=SC1091
+  source ".env"
+  set +a
+fi
+
+export PYTHONUNBUFFERED=1
+export PATH="${HOME}/miniforge3/bin:${HOME}/miniconda3/bin:/opt/homebrew/bin:/usr/local/bin:${PATH:-}"
+
 # ── conda 配置 ──────────────────────────────────────────────
-CONDA_ENV_NAME="erascanner"
+CONDA_ENV_NAME="erachampion"
 CONDA_BIN=""
 
 if command -v conda >/dev/null 2>&1; then
@@ -51,7 +61,7 @@ set -e
 
 # ── 失败时也发飞书告警 ────────────────────────────────────────
 if [ "$EXIT_CODE" -ne 0 ]; then
-  FEISHU_WEBHOOK="${FEISHU_BOT_WEBHOOK:-https://open.feishu.cn/open-apis/bot/v2/hook/d06d0fd7-27a9-4324-a1f1-84f6493c4b86}"
+  FEISHU_WEBHOOK="${FEISHU_BOT_WEBHOOK:-}"
   FAIL_MSG="❌ 时代主角扫描器运行失败（${NOW}）\n退出码: ${EXIT_CODE}\n请检查日志: ${PROJECT_DIR}/${LOG}"
   PAYLOAD="$(python3 -c "import json,os; print(json.dumps({'msg_type':'text','content':{'text':os.environ['M']}},ensure_ascii=False))" M="$FAIL_MSG" 2>/dev/null || true)"
   if [ -n "$PAYLOAD" ]; then
