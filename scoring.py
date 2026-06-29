@@ -18,6 +18,30 @@ def _safe_div(a, b, default=0):
         return default
 
 
+# ── 高增长豁免检测 ─────────────────────────────────────────────
+# 条件：收入 YoY >200% + 量价齐升（1年涨幅>30% 且成交量趋势>10%）
+# 满足时现金流维度改用"增长质量"替代 FCF，并挂叙事风险黄灯。
+def _check_high_growth_exempt(data: dict) -> tuple:
+    """
+    返回 (is_exempt: bool, rev_growth: float)
+    """
+    income_q = data.get("income_q", [])
+    yahoo = data.get("yahoo", {})
+
+    rev_growth = 0.0
+    if len(income_q) >= 5:
+        curr = float(income_q[0].get("revenue", 0))
+        yago = float(income_q[4].get("revenue", 0))
+        rev_growth = _pct_change(curr, yago)
+
+    return_1y    = yahoo.get("return_1y", 0) or 0
+    volume_trend = yahoo.get("volume_trend", 0) or 0
+    price_vol_rising = return_1y > 30 and volume_trend > 10
+
+    is_exempt = rev_growth > 200 and price_vol_rising
+    return is_exempt, rev_growth
+
+
 def _pct_change(new, old, default=0):
     try:
         new, old = float(new or 0), float(old or 0)
@@ -212,7 +236,7 @@ def score_institutional(data: dict) -> dict:
     upside = _pct_change(target_consensus, current_price) if current_price > 0 else 0
     upside_score = _clamp(upside / 0.3)  # 30%+ = 满分
     scores.append(("target_upside", upside_score, 0.25))
-    src = f"近{ptd['coverage_days']}天加权/{ptd['count']}家" if ptd.get("wmedian") else "FMP"
+    src = ptd.get("coverage_label", f"{ptd.get('count','?')}家") if ptd.get("wmedian") else "FMP"
     details["target_consensus"] = f"${target_consensus:.0f}({src})"
     details["current_price"] = f"${current_price:.0f}"
     details["upside_pct"] = f"{upside:.1f}%"
@@ -311,19 +335,65 @@ def score_cashflow(data: dict) -> dict:
     net_income = float(income_q[0].get("netIncome", 0)) if income_q else 0
     revenue = float(income_q[0].get("revenue", 0)) if income_q else 0
 
-    # FCF 是否为正
+    # ── 高增长豁免模式 ──────────────────────────────────────────
+    is_exempt, rev_growth = _check_high_growth_exempt(data)
+    if is_exempt:
+        # 用"增长质量"替代 FCF，共 4 个子项
+        # 1. 收入增速动能（>200%=满分）
+        growth_score = _clamp(min(rev_growth, 500) / 5)
+        scores.append(("revenue_momentum", growth_score, 0.35))
+        details["revenue_growth_yoy"] = f"{rev_growth:.1f}%"
+
+        # 2. 毛利率（高毛利=未来 FCF 潜力）
+        gm = 0
+        if income_q:
+            rev = float(income_q[0].get("revenue", 0))
+            cogs = float(income_q[0].get("costOfRevenue", 0))
+            gm = ((rev - cogs) / rev * 100) if rev > 0 else 0
+        gm_score = _clamp(gm / 0.7 * 100)  # 70%+ 毛利率 = 满分
+        scores.append(("gross_margin_quality", gm_score, 0.30))
+        details["gross_margin"] = f"{gm:.1f}%"
+
+        # 3. 收入加速度（最近一季增速 vs 上一季）
+        accel_score = 50
+        if len(income_q) >= 9:
+            g_curr = _pct_change(float(income_q[0].get("revenue", 0)),
+                                 float(income_q[4].get("revenue", 0)))
+            g_prev = _pct_change(float(income_q[1].get("revenue", 0)),
+                                 float(income_q[5].get("revenue", 0)))
+            if g_curr > g_prev:
+                accel_score = _clamp(50 + (g_curr - g_prev) / 2)
+            else:
+                accel_score = max(20, 50 - (g_prev - g_curr) / 2)
+        scores.append(("growth_acceleration", accel_score, 0.20))
+
+        # 4. 现金储备可持续性（现金 / 季度净亏损 = 季度数）
+        cash = 0
+        burn = abs(min(net_income, 0))  # 亏损额作为 burn rate 代理
+        if cf_q:
+            balance_q = data.get("balance_q", [])
+            cash = float(balance_q[0].get("cashAndCashEquivalents", 0)) if balance_q else 0
+        runway_qtrs = _safe_div(cash, burn) if burn > 0 else 8  # 默认8季
+        runway_score = _clamp(min(runway_qtrs, 8) / 8 * 100)
+        scores.append(("cash_runway", runway_score, 0.15))
+        details["cash_runway_quarters"] = f"{runway_qtrs:.1f}季" if burn > 0 else "盈利/无需评估"
+        details["fcf"] = f"${fcf / 1e9:.2f}B（豁免模式）"
+        details["exempt_mode"] = "⚡ 高增长豁免：收入增速>200%+量价齐升，用增长质量替代FCF"
+
+        total = sum(s * w for _, s, w in scores)
+        return {"score": round(total, 1), "details": details, "high_growth_exempt": True}
+
+    # ── 常规 FCF 模式 ───────────────────────────────────────────
     fcf_positive = fcf > 0
     fcf_pos_score = 100 if fcf_positive else 0
     scores.append(("fcf_positive", fcf_pos_score, 0.30))
     details["fcf"] = f"${fcf / 1e9:.2f}B"
 
-    # FCF / 净利润比率
     fcf_ni_ratio = _safe_div(fcf, net_income) if net_income > 0 else 0
     fcf_ni_score = _clamp(fcf_ni_ratio / 0.7 * 100) if fcf_ni_ratio > 0 else 0
     scores.append(("fcf_to_net_income", fcf_ni_score, 0.30))
     details["fcf_to_net_income"] = f"{fcf_ni_ratio:.2f}"
 
-    # FCF YoY 增速
     fcf_growth = 0
     if len(cf_q) >= 5:
         fcf_old = float(cf_q[4].get("freeCashFlow", 0))
@@ -332,15 +402,13 @@ def score_cashflow(data: dict) -> dict:
     scores.append(("fcf_growth", fcf_g_score, 0.20))
     details["fcf_growth_yoy"] = f"{fcf_growth:.1f}%"
 
-    # 经营现金流 / 收入
     ocf_rev = _safe_div(ocf, revenue) * 100
-    ocf_score = _clamp(ocf_rev / 0.2)  # 20%+ = 满分
+    ocf_score = _clamp(ocf_rev / 0.2)
     scores.append(("ocf_to_revenue", ocf_score, 0.20))
     details["ocf_to_revenue"] = f"{ocf_rev:.1f}%"
 
     total = sum(s * w for _, s, w in scores)
 
-    # 若 FCF 为负，上限 30
     if not fcf_positive:
         total = min(total, 30)
         details["cap_warning"] = "FCF为负，此维度上限30"
@@ -437,6 +505,14 @@ def detect_degradation_signals(data: dict) -> dict:
     yellow = []
     red = []
 
+    # ── 高增长豁免标注（叙事驱动风险）──────────────────────────
+    is_exempt, rev_growth = _check_high_growth_exempt(data)
+    if is_exempt:
+        yellow.append(
+            f"⚡ 叙事驱动风险：现金流维度已豁免（收入增速 {rev_growth:.0f}%+量价齐升），"
+            f"盈利拐点未出现前估值高度依赖叙事，注意回撤风险"
+        )
+
     income_q = data.get("income_q", [])
     surprises = data.get("surprises", [])
 
@@ -482,9 +558,8 @@ def detect_degradation_signals(data: dict) -> dict:
     if ptd.get("count", 0) >= 3:
         target_high = ptd["high"]
         target_low = ptd["low"]
-        target_mean = ptd["wmedian"]   # 用时间衰减加权中位数
-        stale_note = f",{ptd['stale_count']}家已过期" if ptd.get("stale_count", 0) > 0 else ""
-        src_note = f"近{ptd['coverage_days']}天/{ptd['count']}家{stale_note}"
+        target_mean = ptd["wmedian"]
+        src_note = ptd.get("coverage_label", f"{ptd['count']}家")
     else:
         # 数据不足回退 FMP
         target_high = float(pt.get("targetHigh") or yahoo.get("target_high") or 0)

@@ -103,10 +103,27 @@ class FMPClient:
 
 
 # ============================================================
-# 目标价置信度计算（按发布日期衰减）
+# 目标价置信度计算
+# cutoff 优先用最近一次财报日，fallback 到 90 天
 # ============================================================
-def _extract_raw_targets(upgrades_df, cutoff_days: int = 90) -> list:
-    """返回近 cutoff_days 内有目标价的原始记录列表，用于报告展示。"""
+def _resolve_cutoff(last_earnings_date: str = None, fallback_days: int = 90) -> "pd.Timestamp":
+    """
+    返回评级有效起始时间戳（UTC）。
+    优先用最近财报日（分析师在财报后更新才有意义），fallback 到 fallback_days 前。
+    """
+    now = pd.Timestamp(datetime.utcnow(), tz="UTC")
+    if last_earnings_date:
+        try:
+            ts = pd.Timestamp(last_earnings_date, tz="UTC")
+            if ts < now:
+                return ts
+        except Exception:
+            pass
+    return now - pd.Timedelta(days=fallback_days)
+
+
+def _extract_raw_targets(upgrades_df, last_earnings_date: str = None) -> list:
+    """返回财报日之后有目标价的原始记录列表，用于报告展示。"""
     if upgrades_df is None or upgrades_df.empty:
         return []
     df = upgrades_df.copy()
@@ -114,8 +131,7 @@ def _extract_raw_targets(upgrades_df, cutoff_days: int = 90) -> list:
         return []
     if df.index.tz is None:
         df.index = df.index.tz_localize("UTC")
-    now = pd.Timestamp(datetime.utcnow(), tz="UTC")
-    cutoff = now - pd.Timedelta(days=cutoff_days)
+    cutoff = _resolve_cutoff(last_earnings_date)
     df = df[df.index >= cutoff]
     df = df[df["currentPriceTarget"].notna() & (df["currentPriceTarget"] > 0)]
     if df.empty:
@@ -133,11 +149,11 @@ def _extract_raw_targets(upgrades_df, cutoff_days: int = 90) -> list:
     return records
 
 
-def _extract_recent_targets(upgrades_df, cutoff_days: int = 90) -> dict:
+def _extract_recent_targets(upgrades_df, last_earnings_date: str = None) -> dict:
     """
-    从 yfinance upgrades_downgrades 提取近 cutoff_days（默认一个季度）内有目标价的记录。
-    按时间衰减加权：距今越近权重越高，每过 30 天权重折半（半衰期 30 天）。
-    返回 {high, low, wmean, wmedian, count, stale_count, coverage_days}
+    仅取财报日之后的分析师目标价（财报前的评级已过时）。
+    按时间衰减加权：距今越近权重越高，半衰期 14 天。
+    返回 {high, low, wmean, wmedian, count, since, coverage_label}
     """
     if upgrades_df is None or upgrades_df.empty:
         return {}
@@ -149,7 +165,7 @@ def _extract_recent_targets(upgrades_df, cutoff_days: int = 90) -> dict:
         df.index = df.index.tz_localize("UTC")
 
     now = pd.Timestamp(datetime.utcnow(), tz="UTC")
-    cutoff = now - pd.Timedelta(days=cutoff_days)
+    cutoff = _resolve_cutoff(last_earnings_date)
 
     df = df[df["currentPriceTarget"].notna() & (df["currentPriceTarget"] > 0)]
     if df.empty:
@@ -160,9 +176,9 @@ def _extract_recent_targets(upgrades_df, cutoff_days: int = 90) -> dict:
     if df.empty:
         return {}
 
-    # 时间衰减权重：半衰期 30 天（兼容 pandas 3.x：.days 返回 Index 而非 ndarray）
+    # 时间衰减权重：半衰期 14 天（财报后密集更新，近期更重要）
     days_ago = np.array((now - df.index).days, dtype=float)
-    weights = np.exp(-days_ago * np.log(2) / 30)
+    weights = np.exp(-days_ago * np.log(2) / 14)
 
     targets = df["currentPriceTarget"].values
     w = weights / weights.sum()
@@ -178,6 +194,7 @@ def _extract_recent_targets(upgrades_df, cutoff_days: int = 90) -> dict:
     p10 = float(np.percentile(targets, 10))
     p90 = float(np.percentile(targets, 90))
 
+    since_label = cutoff.strftime("%m-%d") if last_earnings_date else f"近90天"
     return {
         "high": p90,
         "low": p10,
@@ -185,7 +202,8 @@ def _extract_recent_targets(upgrades_df, cutoff_days: int = 90) -> dict:
         "wmedian": wmedian,
         "count": len(targets),
         "stale_count": stale_count,
-        "coverage_days": cutoff_days,
+        "since": cutoff.strftime("%Y-%m-%d"),
+        "coverage_label": f"财报后({since_label})/{len(targets)}家",
     }
 
 
@@ -227,14 +245,8 @@ class YahooClient:
                 ud = stock.upgrades_downgrades
             except Exception:
                 ud = None
-            try:
-                result["price_targets_dated"] = _extract_recent_targets(ud)
-            except Exception:
-                result["price_targets_dated"] = {}
-            try:
-                result["price_targets_raw"] = _extract_raw_targets(ud, cutoff_days=90)
-            except Exception:
-                result["price_targets_raw"] = []
+            # last_earnings_date 由 fetch_all_data 注入，这里先留空占位
+            result["_upgrades_df"] = ud
 
 
             if not hist.empty and len(hist) > 20:
@@ -282,10 +294,27 @@ def fetch_all_data(ticker: str, fmp: FMPClient, themes: list) -> dict:
     peers = fmp.stock_peers(ticker)
     time.sleep(0.5)
 
+    # 最近财报日（分析师在此之后的评级才算有效）
+    last_earnings_date = None
+    if surprises:
+        last_earnings_date = surprises[0].get("date")  # stable/earnings 的 date 字段
+
+    # 注入财报日后再提取目标价
+    ud = yahoo.pop("_upgrades_df", None)
+    try:
+        yahoo["price_targets_dated"] = _extract_recent_targets(ud, last_earnings_date)
+    except Exception:
+        yahoo["price_targets_dated"] = {}
+    try:
+        yahoo["price_targets_raw"] = _extract_raw_targets(ud, last_earnings_date)
+    except Exception:
+        yahoo["price_targets_raw"] = []
+
     return {
         "ticker": ticker,
         "themes": themes,
         "price_targets_raw": yahoo.pop("price_targets_raw", []),
+        "last_earnings_date": last_earnings_date,
         "yahoo": yahoo,
         "income_q": income_q,
         "cashflow_q": cashflow_q,
